@@ -140,19 +140,50 @@ jobs:
         WEBDAV_USER: ${{ vars.WEBDAV_USERNAME }}
         WEBDAV_PASS: ${{ vars.WEBDAV_PASSWORD }}
       run: |
-        # 找到最新生成的镜像文件
+        # === 新增：关键调试信息 ===
+        echo "=== 开始 WebDAV 上传调试 ==="
+        echo "1. 检查镜像文件是否存在:"
+        ls -lh hi3798mv100-ubuntu-custom-*.img.gz || echo "未找到镜像文件"
+        
         IMAGE_FILE=$(ls -t hi3798mv100-ubuntu-custom-*.img.gz | head -1)
-        echo "准备上传文件：$IMAGE_FILE"
+        echo "2. 选中上传的文件: $IMAGE_FILE"
+        
+        echo "3. 检查环境变量 (安全模式):"
+        echo "   WEBDAV_URL 的前50字符: '${WEBDAV_URL:0:50}'"
+        echo "   WEBDAV_USER: '$WEBDAV_USER'"
+        WEBDAV_PASS_LENGTH=${#WEBDAV_PASS}
+        echo "   WEBDAV_PASS 长度: $WEBDAV_PASS_LENGTH 字符"
+        
+        # 检查 URL 是否为空
+        if [ -z "${WEBDAV_URL}" ]; then
+          echo "❌ 致命错误: WEBDAV_URL 环境变量为空！"
+          echo "请检查 GitHub 仓库 Settings -> Actions -> Variables 中 WEBDAV_URL 的设置。"
+          exit 1
+        fi
+        
+        FULL_URL="${WEBDAV_URL}${IMAGE_FILE}"
+        echo "4. 拼接后的完整上传URL:"
+        echo "   $FULL_URL"
+        echo "=== 调试信息结束 ==="
+        echo ""
+        # ==========================
 
-        # 使用 curl 命令上传到 WebDAV
-        curl -f --connect-timeout 30 --retry 3 --retry-delay 5 \
+        echo "准备上传文件：$IMAGE_FILE 到 WebDAV..."
+
+        # 使用带详细输出的 curl 命令，便于诊断
+        curl -v --fail --connect-timeout 30 --retry 2 --retry-delay 5 \
           -u "$WEBDAV_USER:$WEBDAV_PASS" \
           -T "$IMAGE_FILE" \
-          "${WEBDAV_URL}${IMAGE_FILE}"
+          "$FULL_URL"
 
-        if [ $? -eq 0 ]; then
-          echo "✅ 镜像已成功上传至 WebDAV：${WEBDAV_URL}${IMAGE_FILE}"
+        CURL_EXIT_CODE=$?
+        if [ $CURL_EXIT_CODE -eq 0 ]; then
+          echo "✅ 镜像已成功上传至 WebDAV：$FULL_URL"
         else
-          echo "❌ 上传到 WebDAV 失败"
-          exit 1
+          echo "❌ curl 上传失败，退出代码: $CURL_EXIT_CODE"
+          echo "常见退出代码含义:"
+          echo "  6: 无法解析主机 (URL 错误或网络问题)"
+          echo "  22: HTTP 错误 (如 401 认证失败, 403 禁止访问, 404 未找到)"
+          echo "  28: 操作超时"
+          exit $CURL_EXIT_CODE
         fi
