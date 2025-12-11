@@ -130,18 +130,17 @@ jobs:
         name: custom-rootfs-image
         path: |
           hi3798mv100-ubuntu-custom-*.img.gz
-        # 修正位置：retention-days 应在此处，与 name/path 对齐
         retention-days: 7
 
-    - name: 上传镜像到 WebDAV
+    - name: 上传镜像到坚果云 WebDAV
       if: success() # 仅在之前所有步骤成功时执行
       env:
-        WEBDAV_URL: ${{ vars.WEBDAV_URL }}       # 例如：https://dav.jianguoyun.com/dav/你的目录/
-        WEBDAV_USER: ${{ vars.WEBDAV_USERNAME }}
-        WEBDAV_PASS: ${{ vars.WEBDAV_PASSWORD }}
+        JIANGUO_WEBDAV_URL: ${{ secrets.JIANGUO_WEBDAV_URL }}
+        JIANGUO_WEBDAV_USER: ${{ secrets.JIANGUO_WEBDAV_USER }}
+        JIANGUO_WEBDAV_PASS: ${{ secrets.JIANGUO_WEBDAV_PASS }}
       run: |
-        # === 新增：关键调试信息 ===
-        echo "=== 开始 WebDAV 上传调试 ==="
+        # === 开始坚果云 WebDAV 上传调试 ===
+        echo "=== 开始坚果云 WebDAV 上传调试 ==="
         echo "1. 检查镜像文件是否存在:"
         ls -lh hi3798mv100-ubuntu-custom-*.img.gz || echo "未找到镜像文件"
         
@@ -149,41 +148,46 @@ jobs:
         echo "2. 选中上传的文件: $IMAGE_FILE"
         
         echo "3. 检查环境变量 (安全模式):"
-        echo "   WEBDAV_URL 的前50字符: '${WEBDAV_URL:0:50}'"
-        echo "   WEBDAV_USER: '$WEBDAV_USER'"
-        WEBDAV_PASS_LENGTH=${#WEBDAV_PASS}
-        echo "   WEBDAV_PASS 长度: $WEBDAV_PASS_LENGTH 字符"
+        echo "   JIANGUO_WEBDAV_URL 的前50字符: '${JIANGUO_WEBDAV_URL:0:50}'"
+        echo "   JIANGUO_WEBDAV_USER: '$JIANGUO_WEBDAV_USER'"
+        JIANGUO_PASS_LENGTH=${#JIANGUO_WEBDAV_PASS}
+        echo "   JIANGUO_WEBDAV_PASS 长度: $JIANGUO_PASS_LENGTH 字符"
         
         # 检查 URL 是否为空
-        if [ -z "${WEBDAV_URL}" ]; then
-          echo "❌ 致命错误: WEBDAV_URL 环境变量为空！"
-          echo "请检查 GitHub 仓库 Settings -> Actions -> Variables 中 WEBDAV_URL 的设置。"
+        if [ -z "${JIANGUO_WEBDAV_URL}" ]; then
+          echo "❌ 致命错误: JIANGUO_WEBDAV_URL 环境变量为空！"
           exit 1
         fi
         
-        FULL_URL="${WEBDAV_URL}${IMAGE_FILE}"
-        echo "4. 拼接后的完整上传URL:"
+        # 坚果云需要确保 URL 以 / 结尾
+        if [[ ! "${JIANGUO_WEBDAV_URL}" =~ /$ ]]; then
+          JIANGUO_WEBDAV_URL="${JIANGUO_WEBDAV_URL}/"
+        fi
+        
+        FULL_URL="${JIANGUO_WEBDAV_URL}${IMAGE_FILE}"
+        echo "4. 坚果云完整上传URL:"
         echo "   $FULL_URL"
         echo "=== 调试信息结束 ==="
         echo ""
-        # ==========================
-
-        echo "准备上传文件：$IMAGE_FILE 到 WebDAV..."
-
-        # 使用带详细输出的 curl 命令，便于诊断
-        curl -v --fail --connect-timeout 30 --retry 2 --retry-delay 5 \
-          -u "$WEBDAV_USER:$WEBDAV_PASS" \
+        
+        echo "准备上传文件：$IMAGE_FILE 到坚果云..."
+        
+        # 坚果云 WebDAV 上传
+        curl -v --fail --connect-timeout 60 --retry 3 --retry-delay 10 \
+          -u "$JIANGUO_WEBDAV_USER:$JIANGUO_WEBDAV_PASS" \
           -T "$IMAGE_FILE" \
           "$FULL_URL"
-
+        
         CURL_EXIT_CODE=$?
         if [ $CURL_EXIT_CODE -eq 0 ]; then
-          echo "✅ 镜像已成功上传至 WebDAV：$FULL_URL"
+          echo "✅ 镜像已成功上传至坚果云 WebDAV：$FULL_URL"
+          echo "坚果云网页版访问：https://www.jianguoyun.com/"
         else
           echo "❌ curl 上传失败，退出代码: $CURL_EXIT_CODE"
-          echo "常见退出代码含义:"
-          echo "  6: 无法解析主机 (URL 错误或网络问题)"
-          echo "  22: HTTP 错误 (如 401 认证失败, 403 禁止访问, 404 未找到)"
-          echo "  28: 操作超时"
+          echo "坚果云常见问题："
+          echo "  - 检查是否使用应用密码（不是登录密码）"
+          echo "  - 检查 WebDAV 目录是否存在"
+          echo "  - 检查是否有足够的存储空间"
+          echo "  - 免费账户上传流量限制：1GB/月"
           exit $CURL_EXIT_CODE
         fi
