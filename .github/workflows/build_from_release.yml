@@ -136,9 +136,9 @@ jobs:
     - name: 上传镜像到 WebDAV
       if: success() # 仅在之前所有步骤成功时执行
       env:
-        WEBDAV_URL: ${{ secrets.WEBDAV_URL }}       # 例如：https://dav.jianguoyun.com/dav/你的目录/
-        WEBDAV_USER: ${{ secrets.WEBDAV_USERNAME }}
-        WEBDAV_PASS: ${{ secrets.WEBDAV_PASSWORD }}
+        WEBDAV_URL: ${{ vars.WEBDAV_URL }}       # 例如：https://dav.jianguoyun.com/dav/你的目录/
+        WEBDAV_USER: ${{ vars.WEBDAV_USERNAME }}
+        WEBDAV_PASS: ${{ vars.WEBDAV_PASSWORD }}
       run: |
         # 找到最新生成的镜像文件
         IMAGE_FILE=$(ls -t hi3798mv100-ubuntu-custom-*.img.gz | head -1)
