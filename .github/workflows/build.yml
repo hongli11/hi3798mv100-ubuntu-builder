@@ -1,95 +1,66 @@
-name: Build Hi3798MV100 RootFS
+name: Hi3798MV100 Ubuntu 自动编译
 
+# 触发条件：推送代码/手动触发
 on:
-  workflow_dispatch: # 允许在 GitHub 网页上手动触发构建
   push:
     branches: [ main ]
-    paths: # 只有关键文件变动时才触发构建，避免浪费资源
-      - 'rootfs-32.img'
-      - 'ubuntu-base-*.tar.gz'
-      - '.github/workflows/build.yml'
+    paths:
+      - 'build_rootfs.sh'
+      - '.github/workflows/auto-build.yml'
+  workflow_dispatch:  # 手动触发开关
 
 jobs:
   build:
-    runs-on: ubuntu-22.04 # 使用 Ubuntu 22.04 的 runner
-    timeout-minutes: 60 # 设置超时，防止卡死
+    runs-on: ubuntu-latest
+    timeout-minutes: 40  # 延长超时（下载镜像需要时间）
+    env:
+      # 全局环境变量（可按需修改）
+      ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}  # 从GitHub Secrets读取密码
+      NETWORK_MODE: "DHCP"
+      HOSTNAME: "hi3798mv100"
 
     steps:
-    - name: 检出代码
-      uses: actions/checkout@v3
+      # 1. 拉取仓库代码
+      - name: 拉取仓库源码
+        uses: actions/checkout@v4
 
-    - name: 设置环境并安装依赖
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y qemu-user-static rsync gzip parted kpartx
+      # 2. 缓存Ubuntu基础镜像（避免重复下载）
+      - name: 缓存Ubuntu Base镜像
+        uses: actions/cache@v3
+        with:
+          path: ./ubuntu-base.tar.gz
+          key: ${{ runner.os }}-ubuntu-base-20.04-armhf
+          restore-keys: |
+            ${{ runner.os }}-ubuntu-base-
 
-    - name: 准备构建空间
-      run: |
-        mkdir -p ubuntu-rootfs
-        mkdir -p /mnt/rootfs
-        # 解压基础系统
-        sudo tar -xpf ubuntu-base-*.tar.gz -C ubuntu-rootfs/
+      # 3. 执行构建脚本
+      - name: 执行自动化构建
+        run: |
+          chmod +x ./build_rootfs.sh
+          ./build_rootfs.sh
 
-    - name: 配置 QEMU 并进入 Chroot 环境构建
-      run: |
-        # 准备 QEMU 静态解释器
-        sudo cp /usr/bin/qemu-arm-static ubuntu-rootfs/usr/bin/
-        # 准备 chroot 环境
-        sudo cp -L /etc/resolv.conf ubuntu-rootfs/etc/resolv.conf
-        sudo mount -t proc /proc ubuntu-rootfs/proc
-        sudo mount -t sysfs /sys ubuntu-rootfs/sys
-        sudo mount -o bind /dev ubuntu-rootfs/dev
-        sudo mount -o bind /dev/pts ubuntu-rootfs/dev/pts
-        
-        # 这里是核心：在 chroot 中执行安装和配置命令
-        # 我们使用 heredoc 将命令通过 chroot 执行，完全模拟你的手动步骤
-        sudo chroot ubuntu-rootfs /bin/bash << 'CHROOT_EOF'
-        # 设置环境变量
-        export DEBIAN_FRONTEND=noninteractive
-        # 更新并安装基础包（这里是你原脚本的精华，但去除了交互）
-        apt-get update
-        apt-get upgrade -y
-        apt-get install -y systemd-sysv rsyslog sudo vim bash-completion \
-          ssh net-tools ethtool ifupdown network-manager iputils-ping wget curl htop
-        # 清理 apt
-        apt-get clean
-        rm -rf /var/lib/apt/lists/*
-        # 设置 root 密码（此处设为默认，你刷机后自己改）
-        echo "root:root123" | chpasswd
-        # 允许 root SSH 登录
-        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-        # 退出 chroot
-        exit
-        CHROOT_EOF
-        
-        # 卸载 chroot 环境
-        sudo umount -lf ubuntu-rootfs/dev/pts
-        sudo umount -lf ubuntu-rootfs/dev
-        sudo umount -lf ubuntu-rootfs/sys
-        sudo umount -lf ubuntu-rootfs/proc
+      # 4. 上传构建产物
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: hi3798mv100-ubuntu-build-${{ github.sha }}
+          path: |
+            ./hi3798mv100-ubuntu-*.img
+            ./hi3798mv100-ubuntu-backup-*.gz
+          retention-days: 90  # 产物保留90天
+          if-no-files-found: error
 
-    - name: 将新系统写入原始镜像
-      run: |
-        # 挂载原始镜像
-        sudo losetup -fP rootfs-32.img
-        LOOP_DEV=$(sudo losetup -j rootfs-32.img | cut -d: -f1)
-        sudo mount ${LOOP_DEV}p1 /mnt/rootfs # 假设根分区是第一个分区
-        # 清空并复制新系统
-        sudo rm -rf /mnt/rootfs/*
-        sudo rsync -a ubuntu-rootfs/ /mnt/rootfs/
-        # 卸载并释放 loop 设备
-        sudo umount /mnt/rootfs
-        sudo losetup -d $LOOP_DEV
-
-    - name: 创建压缩备份文件
-      run: |
-        gzip -9 -k -c rootfs-32.img > backup-$(date +%Y%m%d).gz
-
-    - name: 上传构建产物
-      uses: actions/upload-artifact@v3
-      with:
-        name: built-images
-        path: |
-          rootfs-32.img
-          backup-*.gz
-        retention-days: 7 # 产物保留7天
+      # 5. （可选）上传产物到GitHub Release
+      - name: 上传到GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'  # 仅main分支推送Release
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: 自动构建-${{ github.run_id }}
+          files: |
+            ./hi3798mv100-ubuntu-*.img
+            ./hi3798mv100-ubuntu-backup-*.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动生成的Token
