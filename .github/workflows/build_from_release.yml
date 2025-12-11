@@ -3,7 +3,7 @@ name: Build Hi3798 RootFS from Release Base Image
 on:
   workflow_dispatch: # 手动触发
   push:
-    branches: [ main ] # 主分支推送时触发（可选）
+    branches: [ main ]
 
 jobs:
   build:
@@ -13,35 +13,41 @@ jobs:
     steps:
     - name: 检出仓库代码
       uses: actions/checkout@v4
-      with:
-        submodules: recursive # 如果有子模块
 
     - name: 下载基础镜像
       run: |
-        # 从您指定的 Releases 链接下载已修复的基础镜像
+        # 从 Releases 下载已修复的基础镜像
         wget -O base_rootfs.img https://github.com/hongli11/hi3798mv100-ubuntu-builder/releases/download/v1.0/rootfs-32-fixed.img
-        echo "下载完成。镜像信息："
+        echo "下载完成。基础镜像信息："
         ls -lh base_rootfs.img
+        file base_rootfs.img || true
 
     - name: 安装构建依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y qemu-user-static rsync gzip \
-                               kpartx dosfstools fdisk
+        sudo apt-get install -y qemu-user-static rsync gzip file
 
-    - name: 挂载镜像并准备系统
+    - name: 挂载镜像并准备系统 (智能通用方法)
       run: |
-        # 1. 设置镜像为可读写并挂载
+        # 1. 创建挂载点
         sudo mkdir -p /mnt/rootfs
-        # 使用 kpartx 挂载可能包含多个分区的镜像
-        sudo kpartx -av base_rootfs.img
-        # 假设根文件系统在第一个分区 (loop0p1)，请根据实际情况调整
-        LOOP_DEV=$(sudo losetup --list | grep base_rootfs.img | awk '{print $1}')
-        sudo mount ${LOOP_DEV}p1 /mnt/rootfs
-
-        # 2. 准备 chroot 环境
+        
+        # 2. 创建回环设备（-P 参数尝试扫描分区，兼容有分区表的镜像）
+        LOOP_DEV=$(sudo losetup --show -f -P base_rootfs.img)
+        echo "创建的回环设备: $LOOP_DEV"
+        
+        # 3. 智能挂载：先尝试挂载第一个分区，若失败则挂载整个设备
+        if [ -b "${LOOP_DEV}p1" ]; then
+          echo "检测到分区 ${LOOP_DEV}p1，尝试挂载..."
+          sudo mount ${LOOP_DEV}p1 /mnt/rootfs && echo "成功挂载为分区镜像。"
+        else
+          echo "未检测到标准分区，尝试将整个设备作为文件系统挂载..."
+          sudo mount $LOOP_DEV /mnt/rootfs && echo "成功挂载为直接文件系统镜像。"
+        fi
+        
+        # 4. 准备 chroot 环境
         sudo cp /usr/bin/qemu-arm-static /mnt/rootfs/usr/bin/
-        sudo cp /etc/resolv.conf /mnt/rootfs/etc/resolv.conf
+        [[ -f /etc/resolv.conf ]] && sudo cp /etc/resolv.conf /mnt/rootfs/etc/
         sudo mount -t proc /proc /mnt/rootfs/proc
         sudo mount -t sysfs /sys /mnt/rootfs/sys
         sudo mount -o bind /dev /mnt/rootfs/dev
@@ -49,15 +55,14 @@ jobs:
 
     - name: 在 Chroot 环境中定制系统
       run: |
-        # 使用 heredoc 在 chroot 环境中执行一系列命令
+        # 使用 heredoc 在 chroot 环境中执行命令
         sudo chroot /mnt/rootfs /bin/bash << 'CHROOT_EOF'
-        # 设置环境变量，避免安装过程中的交互提示
+        # 设置环境
         export DEBIAN_FRONTEND=noninteractive
         export LC_ALL=C
+        echo "开始在 chroot 环境中配置系统..."
 
-        echo "开始配置系统..."
-
-        # 1. 更新软件源并升级系统 (使用国内源加速)
+        # 1. 配置软件源并更新
         cat > /etc/apt/sources.list << 'APT_SOURCES'
         deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ focal main restricted universe multiverse
         deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ focal-updates main restricted universe multiverse
@@ -68,7 +73,7 @@ jobs:
         apt-get update
         apt-get upgrade -y
 
-        # 2. 安装核心和常用软件包
+        # 2. 安装核心软件包
         apt-get install -y --no-install-recommends \
           systemd-sysv sudo ssh net-tools iputils-ping \
           wget curl vim-tiny htop less lsof \
@@ -76,60 +81,53 @@ jobs:
           rsyslog cron bash-completion
 
         # 3. 基础系统配置
-        # 设置主机名
         echo "hi3798mv100" > /etc/hostname
         echo -e "127.0.0.1\tlocalhost\n127.0.1.1\thi3798mv100" > /etc/hosts
-
-        # 设置 root 密码（刷机后请务必修改！）
         echo "root:root123" | chpasswd
-        # 允许 Root SSH 登录（仅限首次调试，建议后期关闭）
         sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-        # 4. 网络配置示例（DHCP）
+        # 4. 网络配置 (DHCP)
+        mkdir -p /etc/network/interfaces.d
         cat > /etc/network/interfaces.d/eth0 << 'NET_EOF'
         auto eth0
         iface eth0 inet dhcp
-        # 如需静态IP，注释掉上一行，取消注释并修改以下行
-        # iface eth0 inet static
-        # address 192.168.1.100
-        # netmask 255.255.255.0
-        # gateway 192.168.1.1
-        # dns-nameservers 8.8.8.8
         NET_EOF
 
-        # 5. 清理以减小镜像体积
+        # 5. 清理系统
         apt-get autoremove -y
         apt-get clean
         rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
         echo "系统配置完成！"
         CHROOT_EOF
 
     - name: 完成并打包镜像
       run: |
-        # 1. 卸载 chroot 环境
-        sudo umount -lf /mnt/rootfs/dev/pts
-        sudo umount -lf /mnt/rootfs/dev
-        sudo umount -lf /mnt/rootfs/sys
-        sudo umount -lf /mnt/rootfs/proc
-
-        # 2. 卸载根分区并清理 loop 设备
+        # 1. 卸载 chroot 虚拟文件系统
+        sudo umount -lf /mnt/rootfs/dev/pts 2>/dev/null || true
+        sudo umount -lf /mnt/rootfs/dev 2>/dev/null || true
+        sudo umount -lf /mnt/rootfs/sys 2>/dev/null || true
+        sudo umount -lf /mnt/rootfs/proc 2>/dev/null || true
+        
+        # 2. 卸载根文件系统并清理回环设备
         sudo umount /mnt/rootfs
-        LOOP_DEV=$(sudo losetup --list | grep base_rootfs.img | awk '{print $1}')
-        sudo kpartx -d $LOOP_DEV
-        sudo losetup -d $LOOP_DEV
-
+        LOOP_DEV=$(sudo losetup -j base_rootfs.img | head -1 | cut -d: -f1)
+        if [ -n "$LOOP_DEV" ]; then
+          sudo losetup -d $LOOP_DEV
+          echo "已清理回环设备: $LOOP_DEV"
+        fi
+        
         # 3. 重命名并压缩最终镜像
-        cp base_rootfs.img hi3798mv100-ubuntu-custom-$(date +%Y%m%d).img
-        gzip -9 hi3798mv100-ubuntu-custom-*.img
-
-        echo "生成的文件："
+        FINAL_IMG_NAME="hi3798mv100-ubuntu-custom-$(date +%Y%m%d).img"
+        cp base_rootfs.img "$FINAL_IMG_NAME"
+        gzip -9 "$FINAL_IMG_NAME"
+        
+        echo "构建成功！生成的文件："
         ls -lh *.gz
 
     - name: 上传构建产物
       uses: actions/upload-artifact@v4
       with:
-        name: custom-rootfs-images
+        name: custom-rootfs-image
         path: |
-          hi3798mv100-ubuntu-custom-*.gz
+          hi3798mv100-ubuntu-custom-*.img.gz
         retention-days: 7
