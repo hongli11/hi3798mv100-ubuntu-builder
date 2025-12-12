@@ -1,11 +1,9 @@
 name: Build Pure USB Package
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
   push:
     branches: [ main ]
-    paths:
-      - '.github/workflows/build-pure-usb-package.yml' # 仅在此文件变更时触发
 
 jobs:
   build-usb-pure:
@@ -13,47 +11,27 @@ jobs:
     timeout-minutes: 45
 
     steps:
-    - name: 1. 检出代码 (包含构建脚本)
+    - name: 1. 检出代码
       uses: actions/checkout@v4
 
-    - name: 2. 下载原始USB刷机包
+    - name: 2. 下载指定USB刷机包
       run: |
-        echo "下载海纳思官方USB刷机包..."
-        # 请将下方的URL替换为您找到的具体USB刷机包下载链接
-        # 例如：https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip
-        USB_PACKAGE_URL="https://node4.histb.com:9088/update/system/mv100-mdmo1a-usb-flash.zip"
-        wget --no-check-certificate -c "$USB_PACKAGE_URL" -O original_usb.zip
-        echo "原始USB包信息:"
+        echo "下载海纳思官方USB刷机包 (mdmo1g型号)..."
+        wget --no-check-certificate -c "https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip" -O original_usb.zip
+        echo "下载完成:"
         ls -lh original_usb.zip
 
-    - name: 3. 解压并分析原始USB包
+    - name: 3. 解压并备份原系统文件
       run: |
         mkdir -p usb_template
         unzip -q original_usb.zip -d usb_template/
-        
-        echo "原始USB包内容结构:"
-        find usb_template -type f | sort
-        
-        # 关键：识别USB包内的系统镜像文件（可能不是rootfs-32.img）
-        # 这里列出几种常见名称，您可以按实际情况调整
-        for IMG_NAME in "rootfs.img" "system.img" "rootfs-32.img" "linuxroot.img"; do
-          if [ -f "usb_template/$IMG_NAME" ]; then
-            echo "✅ 发现系统镜像: $IMG_NAME"
-            cp "usb_template/$IMG_NAME" original_usb_system_backup.img
-            export SYSTEM_IMG_NAME="$IMG_NAME"
-            break
-          fi
-        done
-        
-        if [ ! -f "original_usb_system_backup.img" ]; then
-          echo "⚠️  未找到标准镜像名，列出所有.img文件:"
-          find usb_template -name "*.img" -type f
-          echo "请手动检查并设置 SYSTEM_IMG_NAME 环境变量"
-          # 如果找不到，可以尝试手动指定，例如：
-          # export SYSTEM_IMG_NAME="请在此填写实际镜像文件名.img"
-        fi
+        echo "包内容:"
+        ls -la usb_template/mv100/
+        cp "usb_template/mv100/www_ecoo_top.ext4" original_system.ext4
+        echo "✅ 已备份原系统文件:"
+        ls -lh original_system.ext4
 
-    - name: 4. 安装构建依赖
+    - name: 4. 安装依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y qemu-user-static e2fsprogs zip
@@ -63,104 +41,49 @@ jobs:
         chmod +x build_usb_rootfs.sh
         ./build_usb_rootfs.sh
 
-    - name: 6. 创建与原始大小一致的纯净镜像
+    - name: 6. 创建纯净EXT4镜像
       run: |
-        # 获取原始镜像大小
-        ORIG_SIZE=$(stat -c%s "original_usb_system_backup.img")
-        echo "原始系统镜像大小: $ORIG_SIZE 字节"
-        
-        # 创建空白镜像
-        PURE_IMG="usb-rootfs-pure.img"
+        ORIG_SIZE=$(stat -c%s "original_system.ext4")
+        echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
+        PURE_IMG="usb-rootfs-pure.ext4"
         dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
-        
-        # 格式化为ext4并复制文件
-        mkfs.ext4 -F -L "rootfs" "$PURE_IMG"
-        mkdir -p usb_temp_mount
-        sudo mount -o loop "$PURE_IMG" usb_temp_mount
-        sudo cp -a usb_pure_rootfs/* usb_temp_mount/
+        mkfs.ext4 -F -L "pure_root" "$PURE_IMG"
+        mkdir -p temp_mount
+        sudo mount -o loop "$PURE_IMG" temp_mount
+        sudo cp -a usb_pure_rootfs/* temp_mount/
         sync
-        sudo umount usb_temp_mount
-        
-        # 检查文件系统
+        sudo umount temp_mount
         e2fsck -p -f "$PURE_IMG" || true
-        echo "✅ 纯净镜像创建成功:"
+        echo "✅ 纯净镜像:"
         ls -lh "$PURE_IMG"
 
-    - name: 7. 替换并重新打包为完整USB刷机包
+    - name: 7. 替换并重新打包
       run: |
-        # 准备最终打包目录
-        FINAL_USB_DIR=$(pwd)/USB-hi3798mv100-PURE
-        rm -rf "$FINAL_USB_DIR"
-        mkdir -p "$FINAL_USB_DIR"
-        
-        # 复制原始USB包所有文件
-        echo "复制原始USB包结构..."
-        cp -r usb_template/* "$FINAL_USB_DIR"/
-        
-        # 确定要替换的镜像文件名（使用之前识别的名称或手动指定）
-        TARGET_IMG_NAME="${SYSTEM_IMG_NAME:-rootfs-32.img}"
-        echo "将替换的镜像文件: $TARGET_IMG_NAME"
-        
-        # 替换为纯净镜像
-        if [ -f "$FINAL_USB_DIR/$TARGET_IMG_NAME" ]; then
-          rm -f "$FINAL_USB_DIR/$TARGET_IMG_NAME"
-          cp usb-rootfs-pure.img "$FINAL_USB_DIR/$TARGET_IMG_NAME"
-          echo "✅ 已替换 $TARGET_IMG_NAME"
-        else
-          echo "⚠️  目标文件不存在，将纯净镜像以默认名放入包内"
-          cp usb-rootfs-pure.img "$FINAL_USB_DIR/rootfs-pure.img"
-        fi
-        
-        # 添加说明文件
-        cat > "$FINAL_USB_DIR/!!请读我!!.txt" << 'README_EOF'
-        ===========================================
-        Hi3798mv100 纯净系统 USB刷机包 (自制版)
-        ===========================================
-        说明: 本包基于原厂USB刷机包改造，仅替换了系统镜像。
-              刷机工具、分区表、引导程序等均保持不变。
-        
-        系统信息:
-          - 基于: Ubuntu 20.04.5 Base (纯净版)
-          - 主机名: hi3798mv100
-          - root密码: root123
-          - SSH已开启, 允许root登录
-        
-        刷机方法:
-          1. 使用海思官方USB刷机工具 (Hitool等)
-          2. 选择本包中对应的分区表文件
-          3. 按正常流程刷机
-        
-        首次启动后:
-          通过SSH登录 (用户名:root, 密码:root123)
-          执行命令扩展分区: resize2fs /dev/mmcblk0p9
-        
-        构建日期: $(date)
-        README_EOF
-        
-        echo "最终USB包内容:"
-        ls -la "$FINAL_USB_DIR"/
-        
-        # 打包
-        cd "$FINAL_USB_DIR"
-        zip -r ../USB-hi3798mv100-PURE-$(date +%Y%m%d).zip .
+        FINAL_DIR="USB-hi3798mv100-mdmo1g-PURE"
+        rm -rf "$FINAL_DIR"
+        cp -r usb_template "$FINAL_DIR"
+        rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        cp usb-rootfs-pure.ext4 "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        echo "刷机包内容:"
+        ls -l "$FINAL_DIR/mv100/"
+        cd "$FINAL_DIR"
+        zip -r "../USB-hi3798mv100-mdmo1g-PURE-$(date +%Y%m%d).zip" .
         cd ..
-        
-        echo "✅ USB刷机包打包完成!"
-        ls -lh USB-hi3798mv100-PURE-*.zip
+        echo "✅ 最终刷机包:"
+        ls -lh USB-hi3798mv100-mdmo1g-PURE-*.zip
 
-    - name: 8. 上传构建产物
+    - name: 8. 上传产物
       uses: actions/upload-artifact@v4
       with:
         name: pure-usb-package
         path: |
-          USB-hi3798mv100-PURE-*.zip
-          usb-rootfs-pure.img
+          USB-hi3798mv100-mdmo1g-PURE-*.zip
+          usb-rootfs-pure.ext4
         retention-days: 7
 
-    - name: 9. 清理临时文件
+    - name: 9. 清理
       if: always()
       run: |
-        sudo rm -rf usb_pure_rootfs usb_temp_mount usb_template 2>/dev/null || true
-        rm -f original_usb.zip original_usb_system_backup.img 2>/dev/null || true
-        rm -f ubuntu-base-20.04.5-base-armhf.tar.gz 2>/dev/null || true
-        echo "临时文件清理完毕。"
+        sudo rm -rf usb_pure_rootfs temp_mount usb_template 2>/dev/null || true
+        rm -f original_usb.zip original_system.ext4 2>/dev/null || true
+        echo "清理完成。"
