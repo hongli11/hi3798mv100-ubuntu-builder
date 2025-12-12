@@ -24,7 +24,7 @@
         sudo mount -o bind /dev $ROOTFS_DIR/dev
         sudo mount -o bind /dev/pts $ROOTFS_DIR/dev/pts
 
-        # 5.4 在 Chroot 中配置纯净系统
+        # 5.4 在 Chroot 中配置纯净系统 - 使用单引号避免转义问题
         echo "正在 Chroot 环境中安装和配置系统..."
         sudo chroot "$ROOTFS_DIR" /bin/bash << 'CHROOT_EOF'
 #!/bin/bash
@@ -37,7 +37,7 @@ echo "----- 第1步: 配置环境与软件源 -----"
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /var/cache/apt/archives
 
-# 使用华为云镜像源（国内稳定）
+# 使用华为云镜像源（国内稳定）- 使用cat直接写入，避免嵌套heredoc
 cat > /etc/apt/sources.list << 'SOURCES_EOF'
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal main restricted universe multiverse
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal-updates main restricted universe multiverse
