@@ -1,106 +1,189 @@
-    - name: 5. 构建纯净 Ubuntu 根文件系统 (基于官方Base)
-      run: |
-        set -e
-        echo "=== 开始从零构建纯净 Ubuntu 系统 ==="
-        
-        # 5.1 创建临时工作目录
-        ROOTFS_DIR=$(pwd)/pure_rootfs_build
-        sudo rm -rf $ROOTFS_DIR
-        mkdir -p $ROOTFS_DIR
-        
-        # 5.2 下载并解压最干净的 Ubuntu Base 20.04
-        echo "下载官方 ubuntu-base..."
-        wget -c https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-armhf.tar.gz
-        sudo tar -xpf ubuntu-base-20.04.5-base-armhf.tar.gz -C $ROOTFS_DIR
-        
-        # 5.3 准备 chroot 环境
-        echo "准备 Chroot 环境..."
-        sudo cp /usr/bin/qemu-arm-static $ROOTFS_DIR/usr/bin/
-        sudo cp -L /etc/resolv.conf $ROOTFS_DIR/etc/
-        
-        # 挂载虚拟文件系统
-        sudo mount -t proc /proc $ROOTFS_DIR/proc
-        sudo mount -t sysfs /sys $ROOTFS_DIR/sys
-        sudo mount -o bind /dev $ROOTFS_DIR/dev
-        sudo mount -o bind /dev/pts $ROOTFS_DIR/dev/pts
+name: Build Pure TTL Package
 
-        # 5.4 在 Chroot 中配置纯净系统 - 使用单引号避免转义问题
-        echo "正在 Chroot 环境中安装和配置系统..."
-        sudo chroot "$ROOTFS_DIR" /bin/bash << 'CHROOT_EOF'
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+
+    steps:
+    - name: 1. 检出代码
+      uses: actions/checkout@v4
+
+    - name: 2. 下载原始 TTL 刷机包
+      run: |
+        echo "下载海纳思官方 TTL 刷机包..."
+        wget --no-check-certificate -c "https://node4.histb.com:9088/update/system/TTL-hi3798mv100-32bit.zip" -O original_ttl.zip
+        echo "原始刷机包信息:"
+        ls -lh original_ttl.zip
+
+    - name: 3. 解压原始包
+      run: |
+        mkdir -p ttl_template
+        unzip -q original_ttl.zip -d ttl_template/
+        
+        if [ -f "ttl_template/rootfs-32.img" ]; then
+          ORIG_SIZE=$(stat -c%s "ttl_template/rootfs-32.img")
+          echo "原始 rootfs-32.img 大小: $ORIG_SIZE 字节"
+        else
+          echo "错误：未找到 rootfs-32.img"
+          exit 1
+        fi
+
+    - name: 4. 安装构建依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static e2fsprogs zip
+
+    - name: 5. 创建独立构建脚本并执行 (避免YAML嵌套问题)
+      run: |
+        # 创建一个独立的脚本文件，避免YAML中的复杂嵌套
+        cat > build_pure_system.sh << 'SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+echo "=== 创建纯净系统 ==="
+ROOTFS_DIR=$(pwd)/pure_rootfs
+sudo rm -rf $ROOTFS_DIR
+mkdir -p $ROOTFS_DIR
+
+# 下载 Ubuntu Base
+wget -q -c https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-armhf.tar.gz
+sudo tar -xpf ubuntu-base-20.04.5-base-armhf.tar.gz -C $ROOTFS_DIR
+
+# 准备 chroot
+sudo cp /usr/bin/qemu-arm-static $ROOTFS_DIR/usr/bin/
+sudo cp /etc/resolv.conf $ROOTFS_DIR/etc/
+
+# 挂载虚拟文件系统
+sudo mount -t proc /proc $ROOTFS_DIR/proc
+sudo mount -t sysfs /sys $ROOTFS_DIR/sys
+sudo mount -o bind /dev $ROOTFS_DIR/dev
+sudo mount -o bind /dev/pts $ROOTFS_DIR/dev/pts
+
+# 关键：创建chroot内执行的独立脚本
+cat > /tmp/chroot_script.sh << 'INNER_EOF'
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
 
-echo "----- 第1步: 配置环境与软件源 -----"
-# 关键修复：挂载tmpfs解决空间不足
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /var/cache/apt/archives
-
-# 使用华为云镜像源（国内稳定）- 使用cat直接写入，避免嵌套heredoc
-cat > /etc/apt/sources.list << 'SOURCES_EOF'
+echo "配置软件源..."
+cat > /etc/apt/sources.list << 'SOURCES'
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal main restricted universe multiverse
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal-updates main restricted universe multiverse
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal-security main restricted universe multiverse
 deb http://repo.huaweicloud.com/ubuntu-ports/ focal-backports main restricted universe multiverse
-SOURCES_EOF
+SOURCES
 
-echo "----- 第2步: 更新系统并安装核心软件 -----"
+echo "更新并安装软件..."
 apt-get update
-
-# 分阶段安装，确保基础优先
 apt-get install -y systemd systemd-sysv dbus
-apt-get install -y ifupdown net-tools iproute2 iputils-ping
+apt-get install -y ifupdown net-tools iputils-ping
 apt-get install -y openssh-server ssh sudo
-apt-get install -y vim-tiny less lsof htop wget curl
-apt-get install -y cron rsyslog logrotate bash-completion
-apt-get install -y network-manager ethtool
+apt-get install -y vim-tiny wget curl
+apt-get install -y cron rsyslog bash-completion
 
-echo "----- 第3步: 基础系统配置 -----"
-# 主机名与网络
+echo "配置系统..."
 echo "hi3798mv100" > /etc/hostname
-cat > /etc/hosts << 'HOSTS_EOF'
-127.0.0.1   localhost
-127.0.1.1   hi3798mv100
-::1         ip6-localhost ip6-loopback
-fe00::0     ip6-localnet
-ff00::0     ip6-mcastprefix
-ff02::1     ip6-allnodes
-ff02::2     ip6-allrouters
-HOSTS_EOF
-
-# 时区
+echo "127.0.0.1 localhost" > /etc/hosts
+echo "127.0.1.1 hi3798mv100" >> /etc/hosts
 ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-
-# Root 密码
 echo "root:root123" | chpasswd
-
-# SSH 配置（允许Root登录）
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# 网络配置 (DHCP)
 mkdir -p /etc/network/interfaces.d
-cat > /etc/network/interfaces.d/eth0 << 'NET_EOF'
-auto eth0
-iface eth0 inet dhcp
-NET_EOF
+echo "auto eth0" > /etc/network/interfaces.d/eth0
+echo "iface eth0 inet dhcp" >> /etc/network/interfaces.d/eth0
 
-echo "----- 第4步: 深度清理 -----"
-apt-get autoremove -y --purge
+echo "清理..."
+apt-get autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# 移除构建用的模拟器
 rm -f /usr/bin/qemu-arm-static
 
-echo "----- ✅ 纯净 Ubuntu 系统配置完成 -----"
-CHROOT_EOF
+echo "系统配置完成!"
+INNER_EOF
 
-        # 5.5 卸载虚拟文件系统
-        sudo umount -lf $ROOTFS_DIR/dev/pts 2>/dev/null || true
-        sudo umount -lf $ROOTFS_DIR/dev 2>/dev/null || true
-        sudo umount -lf $ROOTFS_DIR/sys 2>/dev/null || true
-        sudo umount -lf $ROOTFS_DIR/proc 2>/dev/null || true
+# 复制脚本到chroot环境并执行
+sudo cp /tmp/chroot_script.sh $ROOTFS_DIR/tmp/
+sudo chmod +x $ROOTFS_DIR/tmp/chroot_script.sh
+sudo chroot $ROOTFS_DIR /bin/bash -c "/tmp/chroot_script.sh"
+
+# 清理
+sudo umount -lf $ROOTFS_DIR/dev/pts 2>/dev/null || true
+sudo umount -lf $ROOTFS_DIR/dev 2>/dev/null || true
+sudo umount -lf $ROOTFS_DIR/sys 2>/dev/null || true
+sudo umount -lf $ROOTFS_DIR/proc 2>/dev/null || true
+
+echo "=== 纯净系统创建完成 ==="
+SCRIPT_EOF
+
+        # 执行构建脚本
+        chmod +x build_pure_system.sh
+        ./build_pure_system.sh
+
+    - name: 6. 创建纯净镜像
+      run: |
+        # 获取原始镜像大小
+        ORIG_SIZE=$(stat -c%s "ttl_template/rootfs-32.img")
+        echo "创建大小为 $ORIG_SIZE 字节的纯净镜像..."
         
-        echo "=== 纯净根文件系统构建完成 ==="
+        # 创建空白镜像
+        dd if=/dev/zero of=rootfs-32-pure.img bs=1 count=0 seek=$ORIG_SIZE
+        
+        # 格式化并复制
+        mkfs.ext4 -F -L "rootfs" rootfs-32-pure.img
+        
+        mkdir -p temp_mount
+        sudo mount -o loop rootfs-32-pure.img temp_mount
+        sudo cp -a pure_rootfs/* temp_mount/
+        sync
+        sudo umount temp_mount
+        
+        e2fsck -p -f rootfs-32-pure.img || true
+        
+        echo "纯净镜像创建成功:"
+        ls -lh rootfs-32-pure.img
+
+    - name: 7. 替换并重新打包
+      run: |
+        # 准备最终包
+        mkdir -p final_package
+        cp -r ttl_template/* final_package/
+        
+        # 替换核心镜像
+        rm -f final_package/rootfs-32.img
+        cp rootfs-32-pure.img final_package/rootfs-32.img
+        
+        # 添加说明
+        echo "纯净 Ubuntu TTL刷机包 - 替换了原版rootfs" > final_package/README.txt
+        echo "构建日期: $(date)" >> final_package/README.txt
+        
+        # 打包
+        cd final_package
+        zip -r ../TTL-hi3798mv100-32bit-PURE.zip .
+        cd ..
+        
+        echo "打包完成! 生成文件:"
+        ls -lh TTL-hi3798mv100-32bit-PURE.zip
+
+    - name: 8. 上传产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: pure-ttl-package
+        path: |
+          TTL-hi3798mv100-32bit-PURE.zip
+          rootfs-32-pure.img
+        retention-days: 7
+
+    - name: 9. 清理
+      if: always()
+      run: |
+        sudo rm -rf pure_rootfs temp_mount final_package 2>/dev/null || true
+        rm -f original_ttl.zip build_pure_system.sh 2>/dev/null || true
+        echo "清理完成"
