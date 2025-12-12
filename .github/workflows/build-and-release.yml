@@ -1,0 +1,333 @@
+name: Build and Release Pure RootFS
+
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-and-release.yml'  # 只有此文件更改时才触发
+
+jobs:
+  build-pure-rootfs:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 下载官方 Ubuntu Base
+      run: |
+        echo "下载官方 Ubuntu Base 20.04.5..."
+        wget -c https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-armhf.tar.gz
+        echo "下载完成，文件大小:"
+        ls -lh *.tar.gz
+
+    - name: 安装构建依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          qemu-user-static \
+          rsync \
+          gzip \
+          e2fsprogs \
+          parted \
+          dosfstools \
+          fdisk
+
+    - name: 准备根文件系统
+      run: |
+        set -e
+        
+        # 创建并清理目录
+        ROOTFS_DIR=$(pwd)/ubuntu_rootfs
+        sudo rm -rf $ROOTFS_DIR
+        mkdir -p $ROOTFS_DIR
+        
+        echo "解压 Ubuntu Base..."
+        sudo tar -xpf ubuntu-base-20.04.5-base-armhf.tar.gz -C $ROOTFS_DIR
+        
+        echo "准备 chroot 环境..."
+        sudo cp /usr/bin/qemu-arm-static $ROOTFS_DIR/usr/bin/
+        sudo cp /etc/resolv.conf $ROOTFS_DIR/etc/
+        
+        # 挂载虚拟文件系统
+        sudo mount -t proc /proc $ROOTFS_DIR/proc
+        sudo mount -t sysfs /sys $ROOTFS_DIR/sys
+        sudo mount -o bind /dev $ROOTFS_DIR/dev
+        sudo mount -o bind /dev/pts $ROOTFS_DIR/dev/pts
+
+    - name: 在 chroot 中配置系统
+      run: |
+        set -e
+        ROOTFS_DIR=$(pwd)/ubuntu_rootfs
+        
+        # 完整的 chroot 配置脚本
+        sudo chroot $ROOTFS_DIR /bin/bash << 'CHROOT_EOF'
+        #!/bin/bash
+        set -e -x
+        
+        export DEBIAN_FRONTEND=noninteractive
+        export LC_ALL=C
+        
+        echo "=== 开始配置纯净 Ubuntu 系统 ==="
+        
+        # 关键：挂载 tmpfs 解决空间问题
+        echo "挂载 tmpfs 解决空间限制..."
+        mount -t tmpfs tmpfs /tmp
+        mount -t tmpfs tmpfs /var/cache/apt/archives
+        
+        # 配置软件源（使用华为云，更稳定）
+        echo "配置华为云软件源..."
+        cat > /etc/apt/sources.list << 'SOURCES_EOF'
+deb http://repo.huaweicloud.com/ubuntu-ports/ focal main restricted universe multiverse
+deb http://repo.huaweicloud.com/ubuntu-ports/ focal-updates main restricted universe multiverse
+deb http://repo.huaweicloud.com/ubuntu-ports/ focal-security main restricted universe multiverse
+deb http://repo.huaweicloud.com/ubuntu-ports/ focal-backports main restricted universe multiverse
+SOURCES_EOF
+        
+        # 更新软件包列表
+        echo "更新软件包列表..."
+        apt-get update
+        
+        # 安装基础系统组件
+        echo "安装 systemd 和基础包..."
+        apt-get install -y systemd systemd-sysv dbus
+        
+        # 安装网络组件
+        echo "安装网络组件..."
+        apt-get install -y \
+          ifupdown \
+          net-tools \
+          iproute2 \
+          iputils-ping \
+          openssh-server \
+          ssh \
+          network-manager
+        
+        # 安装常用工具
+        echo "安装常用工具..."
+        apt-get install -y \
+          sudo \
+          vim-tiny \
+          less \
+          lsof \
+          htop \
+          wget \
+          curl \
+          rsync \
+          cron \
+          rsyslog \
+          logrotate \
+          bash-completion \
+          ca-certificates
+        
+        # 系统配置
+        echo "配置系统设置..."
+        
+        # 主机名
+        echo "hi3798mv100" > /etc/hostname
+        
+        # hosts 文件
+        cat > /etc/hosts << 'HOSTS_EOF'
+127.0.0.1   localhost
+127.0.1.1   hi3798mv100
+::1         ip6-localhost ip6-loopback
+fe00::0     ip6-localnet
+ff00::0     ip6-mcastprefix
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+HOSTS_EOF
+        
+        # 时区
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        
+        # root 密码
+        echo "root:root123" | chpasswd
+        
+        # SSH 配置
+        echo "配置 SSH..."
+        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        
+        # 网络配置（DHCP）
+        mkdir -p /etc/network/interfaces.d
+        cat > /etc/network/interfaces.d/eth0 << 'NET_EOF'
+auto eth0
+iface eth0 inet dhcp
+NET_EOF
+        
+        # 创建必要目录
+        mkdir -p /var/run/sshd
+        mkdir -p /root/.ssh
+        
+        # 清理 APT 缓存
+        echo "清理系统..."
+        apt-get autoremove -y
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+        rm -rf /tmp/*
+        rm -rf /var/tmp/*
+        
+        # 移除 qemu 模拟器
+        rm -f /usr/bin/qemu-arm-static
+        
+        echo "=== 系统配置完成 ==="
+        echo "纯净 Ubuntu 系统已准备就绪"
+        CHROOT_EOF
+
+    - name: 清理 chroot 环境
+      run: |
+        ROOTFS_DIR=$(pwd)/ubuntu_rootfs
+        
+        # 卸载虚拟文件系统
+        sudo umount -lf $ROOTFS_DIR/dev/pts 2>/dev/null || true
+        sudo umount -lf $ROOTFS_DIR/dev 2>/dev/null || true
+        sudo umount -lf $ROOTFS_DIR/sys 2>/dev/null || true
+        sudo umount -lf $ROOTFS_DIR/proc 2>/dev/null || true
+        
+        echo "chroot 环境已清理"
+
+    - name: 创建标准大小的镜像
+      run: |
+        set -e
+        
+        ROOTFS_DIR=$(pwd)/ubuntu_rootfs
+        
+        # 确定镜像大小（与原始镜像一致）
+        IMG_SIZE=837660672  # 原始镜像的字节数，约 799MB
+        
+        echo "创建根文件系统镜像..."
+        
+        # 创建空白镜像文件
+        IMG_NAME="rootfs-32.img"
+        dd if=/dev/zero of="$IMG_NAME" bs=1 count=0 seek=$IMG_SIZE
+        
+        # 创建 ext4 文件系统
+        mkfs.ext4 -F -L "rootfs" "$IMG_NAME"
+        
+        # 挂载并复制文件
+        TEMP_MOUNT=$(pwd)/temp_mount
+        mkdir -p "$TEMP_MOUNT"
+        
+        echo "挂载镜像并复制系统文件..."
+        sudo mount -o loop "$IMG_NAME" "$TEMP_MOUNT"
+        sudo cp -a $ROOTFS_DIR/* "$TEMP_MOUNT"/
+        sync
+        sudo umount "$TEMP_MOUNT"
+        
+        # 检查并修复文件系统
+        e2fsck -p -f "$IMG_NAME" || true
+        
+        # 获取镜像信息
+        echo "镜像创建完成:"
+        ls -lh "$IMG_NAME"
+        echo "文件系统信息:"
+        dumpe2fs -h "$IMG_NAME" | grep -i "block count\|inode count"
+
+    - name: 创建压缩版本（可选）
+      run: |
+        # 创建压缩版本，节省下载流量
+        gzip -9 -c "rootfs-32.img" > "rootfs-32.img.gz"
+        
+        echo "压缩版本创建完成:"
+        ls -lh rootfs-32.img*
+        
+        # 计算压缩率
+        ORIG_SIZE=$(stat -c%s "rootfs-32.img")
+        GZ_SIZE=$(stat -c%s "rootfs-32.img.gz")
+        RATIO=$(echo "scale=1; 100*$GZ_SIZE/$ORIG_SIZE" | bc)
+        echo "压缩率: ${RATIO}%"
+
+    - name: 准备 Release 文件
+      run: |
+        # 创建包含详细信息的 README
+        cat > RELEASE_NOTES.md << 'EOF'
+        # 纯净 Ubuntu RootFS for Hi3798mv100
+        
+        ## 镜像信息
+        - **系统**: Ubuntu 20.04.5 Base (armhf)
+        - **架构**: ARMv7 (32位)
+        - **构建日期**: $(date +%Y-%m-%d)
+        - **镜像大小**: 约 800MB (未压缩)
+        - **压缩大小**: 约 $(ls -lh rootfs-32.img.gz | awk '{print $5}')
+        
+        ## 默认配置
+        - **主机名**: hi3798mv100
+        - **root密码**: root123
+        - **SSH**: 已启用，允许root登录
+        - **软件源**: 华为云镜像
+        - **时区**: Asia/Shanghai
+        
+        ## 包含的软件包
+        - systemd, dbus
+        - OpenSSH Server/Client
+        - 网络工具 (ifupdown, net-tools, iproute2)
+        - 常用工具 (vim, htop, wget, curl)
+        - 系统服务 (cron, rsyslog)
+        
+        ## 使用说明
+        1. 通过 TTL 刷机或 recoverbackup 恢复
+        2. 首次启动后执行: `resize2fs /dev/mmcblk0p9`
+        3. SSH登录: `ssh root@<设备IP>` (密码: root123)
+        
+        ## 注意事项
+        - 这是纯净 Ubuntu 系统，无第三方修改
+        - 刷机前请备份重要数据
+        EOF
+
+    - name: 创建 GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          rootfs-32.img
+          rootfs-32.img.gz
+          RELEASE_NOTES.md
+        tag_name: pure-v1.0
+        name: "纯净 Ubuntu RootFS v1.0"
+        body: |
+          # 纯净 Ubuntu 20.04 系统镜像
+          
+          ## 🆕 新版本特性
+          - 基于官方 Ubuntu 20.04.5 Base
+          - 完全纯净，无第三方修改
+          - 优化构建流程，解决空间不足问题
+          - 预配置华为云软件源
+          
+          ## 📦 文件说明
+          - `rootfs-32.img` - 原始镜像文件 (约800MB)
+          - `rootfs-32.img.gz` - 压缩版本 (约300MB)
+          
+          ## 🔧 刷机方法
+          1. 替换原刷机包中的 rootfs-32.img
+          2. 使用 TTL 工具刷机
+          3. 或通过 recoverbackup 恢复
+          
+          ## ⚠️ 首次启动
+          ```bash
+          resize2fs /dev/mmcblk0p9
+          ```
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 清理临时文件
+      if: always()
+      run: |
+        echo "清理临时文件..."
+        sudo rm -rf ubuntu_rootfs temp_mount 2>/dev/null || true
+        rm -f ubuntu-base-20.04.5-base-armhf.tar.gz 2>/dev/null || true
+        
+        # 可选：保留最终镜像文件
+        echo "保留的构建产物:"
+        ls -lh *.img* 2>/dev/null || echo "无镜像文件"
+
+    - name: 上传构建日志
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          ${{ github.workspace }}/*.log
+        retention-days: 7
