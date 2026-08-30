@@ -1,0 +1,24 @@
+# 构建产物
+cache/
+pure_rootfs/
+usb_pure_rootfs/
+temp_mount/
+ttl_template/
+usb_template/
+final_package/
+USB-hi3798mv100-mdmo1g-PURE/
+
+# 镜像与压缩包
+*.img
+*.ext4
+*.tar.gz
+*.zip
+SHA256SUMS
+
+# 下载的原始包
+original_ttl.zip
+original_usb.zip
+original_system.ext4
+
+# 系统文件
+.DS_Store

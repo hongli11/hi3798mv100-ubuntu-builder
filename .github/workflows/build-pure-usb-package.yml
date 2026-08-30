@@ -1,0 +1,138 @@
+name: Build Pure USB Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      usb_url:
+        description: '原始 USB 刷机包下载地址'
+        required: false
+        default: 'https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip'
+      base_version:
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
+        required: false
+        default: '20.04.5'
+      base_url:
+        description: 'Ubuntu Base 下载目录'
+        required: false
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
+      mirror:
+        description: 'apt 软件源镜像'
+        required: false
+        default: 'http://repo.huaweicloud.com/ubuntu-ports'
+      root_password:
+        description: 'root 登录密码（生产环境务必修改）'
+        required: false
+        default: 'root123'
+  push:
+    branches: [ main ]
+    paths:
+      - 'build_rootfs.sh'
+      - 'build_usb_rootfs.sh'
+      - 'lib/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: build-usb-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-usb-pure:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      USB_URL: ${{ inputs.usb_url || 'https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip' }}
+      UBUNTU_VERSION: ${{ inputs.base_version }}
+      BASE_URL: ${{ inputs.base_url }}
+      MIRROR: ${{ inputs.mirror }}
+      ROOT_PASSWORD: ${{ inputs.root_password }}
+
+    steps:
+    - name: 1. 检出代码
+      uses: actions/checkout@v4
+
+    - name: 2. 下载原始 USB 刷机包
+      run: |
+        wget --no-check-certificate -c --tries=5 --timeout=60 --waitretry=10 "$USB_URL" -O original_usb.zip
+        ls -lh original_usb.zip
+        unzip -tq original_usb.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
+        echo "✅ 原始包完整性 OK"
+
+    - name: 3. 解压并备份原系统文件
+      run: |
+        rm -rf usb_template
+        mkdir -p usb_template
+        unzip -q original_usb.zip -d usb_template/
+        echo "包内容:"
+        ls -la usb_template/mv100/
+        test -f "usb_template/mv100/www_ecoo_top.ext4" && echo "✅ 找到 www_ecoo_top.ext4" || { echo "❌ 未找到 www_ecoo_top.ext4"; exit 1; }
+        cp "usb_template/mv100/www_ecoo_top.ext4" original_system.ext4
+        echo "✅ 已备份原系统文件:"
+        ls -lh original_system.ext4
+
+    - name: 4. 安装依赖
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
+
+    - name: 5. 缓存 Ubuntu Base 镜像（版本固定，可安全复用）
+      uses: actions/cache@v4
+      with:
+        path: cache/ubuntu-base-*.tar.gz
+        key: ubuntu-base-${{ inputs.base_version || '20.04.5' }}
+
+    - name: 6. 构建纯净根文件系统
+      run: |
+        chmod +x build_usb_rootfs.sh
+        ./build_usb_rootfs.sh
+
+    - name: 7. 创建纯净 ext4 镜像
+      run: |
+        ORIG_SIZE=$(stat -c%s "original_system.ext4")
+        echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
+        PURE_IMG="usb-rootfs-pure.ext4"
+        dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
+        mkfs.ext4 -F -m 0 -L "pure_root" "$PURE_IMG"
+        mkdir -p temp_mount
+        sudo mount -o loop "$PURE_IMG" temp_mount
+        sudo cp -a usb_pure_rootfs/. temp_mount/
+        sync
+        sudo umount temp_mount
+        e2fsck -p -f "$PURE_IMG" || true
+        echo "✅ 纯净镜像:"
+        ls -lh "$PURE_IMG"
+
+    - name: 8. 替换并重新打包
+      run: |
+        FINAL_DIR="USB-hi3798mv100-mdmo1g-PURE"
+        rm -rf "$FINAL_DIR"
+        cp -r usb_template "$FINAL_DIR"
+        rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        cp usb-rootfs-pure.ext4 "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        echo "刷机包内容:"
+        ls -l "$FINAL_DIR/mv100/"
+        cd "$FINAL_DIR"
+        zip -q -r "../USB-hi3798mv100-mdmo1g-PURE-$(date +%Y%m%d).zip" .
+        cd ..
+        echo "✅ 最终刷机包:"
+        ls -lh USB-hi3798mv100-mdmo1g-PURE-*.zip
+
+    - name: 9. 上传产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: pure-usb-package
+        path: |
+          USB-hi3798mv100-mdmo1g-PURE-*.zip
+          usb-rootfs-pure.ext4
+        retention-days: 7
+        if-no-files-found: error
+
+    - name: 10. 清理
+      if: always()
+      run: |
+        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-mdmo1g-PURE 2>/dev/null || true
+        rm -f original_usb.zip original_system.ext4 usb-rootfs-pure.ext4 2>/dev/null || true
+        echo "✅ 清理完成。"

@@ -1,0 +1,129 @@
+name: Build Pure TTL Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ttl_url:
+        description: '原始 TTL 刷机包下载地址'
+        required: false
+        default: 'https://node4.histb.com:9088/update/system/TTL-hi3798mv100-32bit.zip'
+      base_version:
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
+        required: false
+        default: '20.04.5'
+      base_url:
+        description: 'Ubuntu Base 下载目录'
+        required: false
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
+      mirror:
+        description: 'apt 软件源镜像'
+        required: false
+        default: 'http://repo.huaweicloud.com/ubuntu-ports'
+      root_password:
+        description: 'root 登录密码（生产环境务必修改）'
+        required: false
+        default: 'root123'
+  push:
+    branches: [ main ]
+    paths:
+      - 'build_rootfs.sh'
+      - 'build_usb_rootfs.sh'
+      - 'lib/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: build-ttl-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      TTL_URL: ${{ inputs.ttl_url || 'https://node4.histb.com:9088/update/system/TTL-hi3798mv100-32bit.zip' }}
+      UBUNTU_VERSION: ${{ inputs.base_version }}
+      BASE_URL: ${{ inputs.base_url }}
+      MIRROR: ${{ inputs.mirror }}
+      ROOT_PASSWORD: ${{ inputs.root_password }}
+
+    steps:
+    - name: 1. 检出代码
+      uses: actions/checkout@v4
+
+    - name: 2. 下载原始 TTL 包
+      run: |
+        wget --no-check-certificate -c --tries=5 --timeout=60 --waitretry=10 "$TTL_URL" -O original_ttl.zip
+        ls -lh original_ttl.zip
+        unzip -tq original_ttl.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
+        echo "✅ 原始包完整性 OK"
+
+    - name: 3. 解压原始包
+      run: |
+        rm -rf ttl_template
+        mkdir -p ttl_template
+        unzip -q original_ttl.zip -d ttl_template/
+        ls -la ttl_template/
+        test -f ttl_template/rootfs-32.img && echo "✅ 找到 rootfs-32.img" || { echo "❌ 包内未找到 rootfs-32.img"; exit 1; }
+
+    - name: 4. 安装依赖
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
+
+    - name: 5. 缓存 Ubuntu Base 镜像（版本固定，可安全复用）
+      uses: actions/cache@v4
+      with:
+        path: cache/ubuntu-base-*.tar.gz
+        key: ubuntu-base-${{ inputs.base_version || '20.04.5' }}
+
+    - name: 6. 构建纯净根文件系统
+      run: |
+        chmod +x build_rootfs.sh
+        ./build_rootfs.sh
+
+    - name: 7. 创建纯净 ext4 镜像
+      run: |
+        ORIG_SIZE=$(stat -c%s "ttl_template/rootfs-32.img")
+        echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
+        dd if=/dev/zero of=rootfs-32-pure.img bs=1 count=0 seek=$ORIG_SIZE status=progress
+        mkfs.ext4 -F -m 0 -L "rootfs" rootfs-32-pure.img
+        mkdir -p temp_mount
+        sudo mount -o loop rootfs-32-pure.img temp_mount
+        sudo cp -a pure_rootfs/. temp_mount/
+        sync
+        sudo umount temp_mount
+        e2fsck -p -f rootfs-32-pure.img || true
+        echo "✅ 镜像创建成功:"
+        ls -lh rootfs-32-pure.img
+
+    - name: 8. 替换并打包
+      run: |
+        rm -rf final_package
+        cp -r ttl_template/ final_package/
+        cp rootfs-32-pure.img final_package/rootfs-32.img
+        cd final_package
+        zip -q -r "../TTL-hi3798mv100-32bit-PURE-$(date +%Y%m%d).zip" .
+        cd ..
+        echo "最终刷机包:"
+        ls -lh TTL-hi3798mv100-32bit-PURE-*.zip
+
+    - name: 9. 上传产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: pure-ttl-package
+        path: |
+          TTL-hi3798mv100-32bit-PURE-*.zip
+          rootfs-32-pure.img
+        retention-days: 7
+        if-no-files-found: error
+
+    - name: 10. 清理
+      if: always()
+      run: |
+        sudo rm -rf pure_rootfs temp_mount ttl_template final_package 2>/dev/null || true
+        rm -f original_ttl.zip rootfs-32-pure.img 2>/dev/null || true
+        echo "✅ 清理完成。"
